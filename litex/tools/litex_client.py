@@ -21,41 +21,47 @@ from litex.tools.remote.csr_builder import CSRBuilder
 # Remote Client ------------------------------------------------------------------------------------
 
 class RemoteClient(EtherboneIPC, CSRBuilder):
+    max_burst_length = 255
+
     def __init__(self, host="localhost", port=1234, base_address=0, csr_csv=None, csr_data_width=None,
-        csr_bus_address_width=None, debug=False):
+        csr_bus_address_width=None, debug=False, timeout=2.0, raise_on_timeout=False):
         # If csr_csv set to None and local csr.csv file exists, use it.
         if csr_csv is None and os.path.exists("csr.csv"):
             csr_csv = "csr.csv"
         # If valid csr_csv file found, build the CSRs.
         if csr_csv is not None:
-            CSRBuilder.__init__(self, self, csr_csv, csr_data_width)
+            CSRBuilder.__init__(self, self, csr_csv, csr_data_width, csr_bus_address_width)
         else:
-            # Else if csr_data_width set to None, force to csr_data_width 32-bit.
-            if csr_data_width is None:
-                self.csr_data_width = 32
-            # Else if csr_bus_address_width set to None, force to csr_bus_address_width 32-bit.
-            if csr_bus_address_width is None:
-                self.csr_bus_address_width = 32
-        self.host         = host
-        self.port         = port
-        self.debug        = debug
-        self.binded       = False
-        self.base_address = base_address if base_address is not None else 0
+            # Else use provided CSR widths, defaulting to 32-bit.
+            self.csr_data_width        = 32 if csr_data_width        is None else csr_data_width
+            self.csr_bus_address_width = 32 if csr_bus_address_width is None else csr_bus_address_width
+        self.host             = host
+        self.port             = port
+        self.debug            = debug
+        self.timeout          = timeout
+        self.binded           = False
+        self.base_address     = base_address if base_address is not None else 0
+        self.raise_on_timeout = raise_on_timeout
 
     def _receive_server_info(self):
-        info = str(self.socket.recv(128))
+        info = self.socket.recv(128).decode("utf-8", errors="ignore")
 
         # With LitePCIe, CSRs are translated to 0 to limit BAR0 size, so also translate base address.
-        if "CommPCIe" in info:
+        if "CommPCIe" in info and hasattr(self, "mems") and hasattr(self.mems, "csr"):
             self.base_address = -self.mems.csr.base
 
     def open(self):
         if self.binded:
             return
-        self.socket = socket.create_connection((self.host, self.port))
-        self.socket.settimeout(2.0)
-        self._receive_server_info()
-        self.binded = True
+        self.socket = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        try:
+            self.socket.settimeout(self.timeout)
+            self._receive_server_info()
+            self.binded = True
+        except Exception:
+            self.socket.close()
+            del self.socket
+            raise
 
     def close(self):
         if not self.binded:
@@ -63,6 +69,13 @@ class RemoteClient(EtherboneIPC, CSRBuilder):
         self.socket.close()
         del self.socket
         self.binded = False
+
+    def __enter__(self):
+        self.open()
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
     def clear_socket_buffer(self):
         try:
@@ -73,15 +86,20 @@ class RemoteClient(EtherboneIPC, CSRBuilder):
         except (TimeoutError, socket.error):
             pass
 
-    def read(self, addr, length=None, burst="incr"):
-        length_int = 1 if length is None else length
-        addr_size  = self.csr_bus_address_width // 8
+    @staticmethod
+    def _check_burst(burst):
+        if burst not in ["incr", "fixed"]:
+            raise ValueError("Unsupported burst mode: {}".format(burst))
+
+    def _read_chunk(self, addr, length, burst):
+        addr_size = self.csr_bus_address_width // 8
+        incr      = burst == "incr"
+
         # Prepare packet
         record = EtherboneRecord(addr_size)
-        incr = (burst == "incr")
         record.reads  = EtherboneReads(
             addr_size = addr_size,
-            addrs     = [self.base_address + addr + 4*incr*j for j in range(length_int)]
+            addrs     = [self.base_address + addr + 4*incr*j for j in range(length)]
         )
         record.rcount = len(record.reads)
 
@@ -94,11 +112,14 @@ class RemoteClient(EtherboneIPC, CSRBuilder):
         # Receive response
         response = self.receive_packet(self.socket, addr_size)
         if response == 0:
-            # Handle error by returning default values
             if self.debug:
-                print("Timeout occurred during read. Returning default values.")
+                message = "Timeout occurred during read."
+                message += " Raising TimeoutError." if self.raise_on_timeout else " Returning default values."
+                print(message)
             self.clear_socket_buffer()
-            return 0 if length is None else [0] * length_int
+            if self.raise_on_timeout:
+                raise TimeoutError("Timeout occurred during read.")
+            return [0] * length
 
         packet = EtherbonePacket(
             addr_width = self.csr_bus_address_width,
@@ -108,17 +129,28 @@ class RemoteClient(EtherboneIPC, CSRBuilder):
         datas = packet.records.pop().writes.get_datas()
         if self.debug:
             for i, data in enumerate(datas):
-                print("read 0x{:08x} @ 0x{:08x}".format(data, self.base_address + addr + 4*i))
+                print("read 0x{:08x} @ 0x{:08x}".format(data, self.base_address + addr + 4*incr*i))
+        return datas
+
+    def read(self, addr, length=None, burst="incr"):
+        self._check_burst(burst)
+        length_int = 1 if length is None else length
+        incr       = burst == "incr"
+        datas      = []
+
+        for offset in range(0, length_int, self.max_burst_length):
+            burst_length = min(length_int - offset, self.max_burst_length)
+            burst_addr   = addr + 4*incr*offset
+            datas += self._read_chunk(burst_addr, burst_length, burst)
         return datas[0] if length is None else datas
 
-    def write(self, addr, datas):
-        datas = datas if isinstance(datas, list) else [datas]
+    def _write_chunk(self, addr, datas):
         addr_size = self.csr_bus_address_width // 8
         record = EtherboneRecord(addr_size)
         record.writes = EtherboneWrites(
             base_addr = self.base_address + addr,
             addr_size = addr_size,
-            datas     = [d for d in datas]
+            datas     = datas
         )
         record.wcount = len(record.writes)
 
@@ -127,9 +159,20 @@ class RemoteClient(EtherboneIPC, CSRBuilder):
         packet.encode()
         self.send_packet(self.socket, packet)
 
+    def write(self, addr, datas, burst="incr"):
+        self._check_burst(burst)
+        datas = datas if isinstance(datas, list) else [datas]
+        incr  = burst == "incr"
+        step  = self.max_burst_length if incr else 1
+
+        for offset in range(0, len(datas), step):
+            burst_datas = datas[offset:offset + step]
+            burst_addr  = addr + 4*incr*offset
+            self._write_chunk(burst_addr, burst_datas)
+
         if self.debug:
             for i, data in enumerate(datas):
-                print("write 0x{:08x} @ 0x{:08x}".format(data, self.base_address + addr + 4*i))
+                print("write 0x{:08x} @ 0x{:08x}".format(data, self.base_address + addr + 4*incr*i))
 
 # Utils --------------------------------------------------------------------------------------------
 
@@ -140,84 +183,111 @@ def reg2addr(host, csr_csv, reg):
     else:
         raise ValueError(f"Register {reg} not present, exiting.")
 
-def dump_identifier(host, csr_csv, port):
-    bus = RemoteClient(host=host, csr_csv=csr_csv, port=port)
-    bus.open()
-
+def dump_identifier(host, csr_csv, port, timeout=2.0, raise_on_timeout=False):
     fpga_identifier = ""
 
-    for i in range(256):
-        c = chr(bus.read(bus.bases.identifier_mem + 4*i) & 0xff)
-        fpga_identifier += c
-        if c == "\0":
-            break
+    with RemoteClient(
+        host             = host,
+        csr_csv          = csr_csv,
+        port             = port,
+        timeout          = timeout,
+        raise_on_timeout = raise_on_timeout,
+    ) as bus:
+        for i in range(256):
+            c = chr(bus.read(bus.bases.identifier_mem + 4*i) & 0xff)
+            fpga_identifier += c
+            if c == "\0":
+                break
 
     print(fpga_identifier)
 
-    bus.close()
+def dump_registers(host, csr_csv, port, filter=None, binary=False, timeout=2.0, raise_on_timeout=False):
+    with RemoteClient(
+        host             = host,
+        csr_csv          = csr_csv,
+        port             = port,
+        timeout          = timeout,
+        raise_on_timeout = raise_on_timeout,
+    ) as bus:
+        for name, register in bus.regs.__dict__.items():
+            if (filter is None) or filter in name:
+                register_value = {
+                    True  : f"0b{register.read():032b}",
+                    False : f"0x{register.read():08x}",
+                }[binary]
+                print("0x{:08x} : {} {}".format(register.addr, register_value, name))
 
-def dump_registers(host, csr_csv, port, filter=None, binary=False):
-    bus = RemoteClient(host=host, csr_csv=csr_csv, port=port)
-    bus.open()
+def _word_count(length):
+    return (length + 3) // 4
 
-    for name, register in bus.regs.__dict__.items():
-        if (filter is None) or filter in name:
-            register_value = {
-                True  : f"0b{register.read():032b}",
-                False : f"0x{register.read():08x}",
-            }[binary]
-            print("0x{:08x} : {} {}".format(register.addr, register_value, name))
+def read_memory(host, csr_csv, port, addr, length, binary=False, file=None, endianness="little", timeout=2.0,
+    raise_on_timeout=False):
+    word_count = _word_count(length)
 
-    bus.close()
-
-def read_memory(host, csr_csv, port, addr, length, binary=False, file=None, endianness="little"):
-    bus = RemoteClient(host=host, csr_csv=csr_csv, port=port)
-    bus.open()
+    with RemoteClient(
+        host             = host,
+        csr_csv          = csr_csv,
+        port             = port,
+        timeout          = timeout,
+        raise_on_timeout = raise_on_timeout,
+    ) as bus:
+        datas = [] if word_count == 0 else bus.read(addr, word_count, burst="incr")
 
     if file:
-        # Read from memory and write to file in binary mode
-        with open(file, 'wb') as f:
-            for offset in range(length // 4):
-                data = bus.read(addr + 4 * offset)
-                f.write(data.to_bytes(4, byteorder=endianness))
+        # Read from memory and write to file in binary mode.
+        with open(file, "wb") as f:
+            data = b"".join([data.to_bytes(4, byteorder=endianness) for data in datas])[:length]
+            f.write(data)
     else:
-        # Print to console
-        for offset in range(length // 4):
+        # Print to console.
+        for offset, data in enumerate(datas):
             register_value = {
-                True  : f"0b{bus.read(addr + 4 * offset):032b}",
-                False : f"0x{bus.read(addr + 4 * offset):08x}",
+                True  : f"0b{data:032b}",
+                False : f"0x{data:08x}",
             }[binary]
             print(f"0x{addr + 4 * offset:08x} : {register_value}")
 
-    bus.close()
+def write_memory(host, csr_csv, port, addr, data, file=None, length=None, endianness="little", timeout=2.0,
+    raise_on_timeout=False):
+    with RemoteClient(
+        host             = host,
+        csr_csv          = csr_csv,
+        port             = port,
+        timeout          = timeout,
+        raise_on_timeout = raise_on_timeout,
+    ) as bus:
+        if file:
+            # Read from file and write to memory.
+            with open(file, "rb") as f:
+                if length:
+                    data = f.read(length)
+                else:
+                    data = f.read()
 
-def write_memory(host, csr_csv, port, addr, data, file=None, length=None, endianness="little"):
-    bus = RemoteClient(host=host, csr_csv=csr_csv, port=port)
-    bus.open()
-
-    if file:
-        # Read from file and write to memory
-        with open(file, 'rb') as f:
-            if length:
-                data = f.read(length)
-            else:
-                data = f.read()
-            # Write data in 32-bit chunks
+            datas = []
             for i in range(0, len(data), 4):
-                word = int.from_bytes(data[i:i + 4], byteorder=endianness)
-                bus.write(addr + i, word)
-    else:
-        # Write single data value to memory
-        bus.write(addr, data)
+                chunk = data[i:i + 4]
+                chunk += bytes(4 - len(chunk))
+                datas.append(int.from_bytes(chunk, byteorder=endianness))
 
-    bus.close()
+            if datas:
+                bus.write(addr, datas, burst="incr")
+        else:
+            # Write single data value to memory.
+            bus.write(addr, data)
 
 # GUI ----------------------------------------------------------------------------------------------
 
-def run_gui(host, csr_csv, port):
+def run_gui(host, csr_csv, port, timeout=2.0, raise_on_timeout=False):
     import dearpygui.dearpygui as dpg
 
-    bus = RemoteClient(host, csr_csv=csr_csv, port=port)
+    bus = RemoteClient(
+        host,
+        csr_csv          = csr_csv,
+        port             = port,
+        timeout          = timeout,
+        raise_on_timeout = raise_on_timeout,
+    )
     bus.open()
 
     # Board capabilities.
@@ -648,6 +718,8 @@ def main():
     parser.add_argument("--binary",     action="store_true",     help="Use binary format for displayed values.")
     parser.add_argument("--file",       default=None,            help="File to read from or write to in binary mode.")
     parser.add_argument("--endianness", default="little",        choices=["little", "big"], help="Endianness for memory accesses (little or big).")
+    parser.add_argument("--timeout",        default="2.0",          help="Socket timeout.")
+    parser.add_argument("--strict-timeout", action="store_true",    help="Raise on remote read timeout.")
 
     # Identifier.
     parser.add_argument("--ident",      action="store_true",     help="Dump SoC identifier.")
@@ -670,23 +742,28 @@ def main():
     host    = args.host
     csr_csv = args.csr_csv
     port    = int(args.port, 0)
+    timeout = float(args.timeout)
 
     # Identifier.
     if args.ident:
         dump_identifier(
-            host    = host,
-            csr_csv = csr_csv,
-            port    = port,
+            host             = host,
+            csr_csv          = csr_csv,
+            port             = port,
+            timeout          = timeout,
+            raise_on_timeout = args.strict_timeout,
         )
 
     # Registers.
     if args.regs:
         dump_registers(
-            host    = host,
-            csr_csv = csr_csv,
-            port    = port,
-            filter  = args.filter,
-            binary  = args.binary,
+            host             = host,
+            csr_csv          = csr_csv,
+            port             = port,
+            filter           = args.filter,
+            binary           = args.binary,
+            timeout          = timeout,
+            raise_on_timeout = args.strict_timeout,
         )
 
     # Memory Read.
@@ -696,14 +773,16 @@ def main():
         except ValueError:
             addr = reg2addr(host, csr_csv, args.read)
         read_memory(
-            host       = host,
-            csr_csv    = csr_csv,
-            port       = port,
-            addr       = addr,
-            length     = int(args.length, 0),
-            binary     = args.binary,
-            file       = args.file,
-            endianness = args.endianness,
+            host             = host,
+            csr_csv          = csr_csv,
+            port             = port,
+            addr             = addr,
+            length           = int(args.length, 0),
+            binary           = args.binary,
+            file             = args.file,
+            endianness       = args.endianness,
+            timeout          = timeout,
+            raise_on_timeout = args.strict_timeout,
         )
 
     # Memory Write.
@@ -722,22 +801,26 @@ def main():
             data = int(args.write[1], 0)
 
         write_memory(
-            host       = host,
-            csr_csv    = csr_csv,
-            port       = port,
-            addr       = addr,
-            data       = data,
-            file       = args.file,
-            length     = int(args.length, 0) if args.length else None,
-            endianness = args.endianness,
+            host             = host,
+            csr_csv          = csr_csv,
+            port             = port,
+            addr             = addr,
+            data             = data,
+            file             = args.file,
+            length           = int(args.length, 0) if args.length else None,
+            endianness       = args.endianness,
+            timeout          = timeout,
+            raise_on_timeout = args.strict_timeout,
         )
 
     # GUI.
     if args.gui:
         run_gui(
-            host    = host,
-            csr_csv = csr_csv,
-            port    = port,
+            host             = host,
+            csr_csv          = csr_csv,
+            port             = port,
+            timeout          = timeout,
+            raise_on_timeout = args.strict_timeout,
         )
 
 if __name__ == "__main__":

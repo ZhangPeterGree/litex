@@ -9,7 +9,6 @@ from litex.gen import *
 from litex.soc.cores.clock.common import *
 from litex.soc.cores.clock.xilinx_common import *
 from typing import Dict, Any
-import math
 
 # Xilinx / Ultrascale Plus PLL ---------------------------------------------------------------------
 
@@ -56,10 +55,10 @@ class USPPLL(XilinxClocking):
             i_CLKFBIN       = pll_fb,
             o_CLKFBOUT      = pll_fb,
         )
-        for n, (clk, f, p, m) in sorted(self.clkouts.items()):
+        for n, clkout in sorted(self.clkouts.items()):
             self.params["p_CLKOUT{}_DIVIDE".format(n)] = config["clkout{}_divide".format(n)]
             self.params["p_CLKOUT{}_PHASE".format(n)]  = config["clkout{}_phase".format(n)]
-            self.params["o_CLKOUT{}".format(n)]        = clk
+            self.params["o_CLKOUT{}".format(n)]        = clkout.clk
         self.specials += Instance("PLLE2_ADV", name=self.name or "", **self.params)
 
 # Xilinx / Ultrascale Plus MMCM --------------------------------------------------------------------
@@ -104,13 +103,13 @@ class USPMMCM(XilinxClocking):
             i_CLKFBIN         = mmcm_fb,
             o_CLKFBOUT        = mmcm_fb,
         )
-        for n, (clk, f, p, m) in sorted(self.clkouts.items()):
+        for n, clkout in sorted(self.clkouts.items()):
             if n == 0:
                 self.params["p_CLKOUT{}_DIVIDE_F".format(n)] = config["clkout{}_divide".format(n)]
             else:
                 self.params["p_CLKOUT{}_DIVIDE".format(n)] = config["clkout{}_divide".format(n)]
             self.params["p_CLKOUT{}_PHASE".format(n)] = config["clkout{}_phase".format(n)]
-            self.params["o_CLKOUT{}".format(n)]       = clk
+            self.params["o_CLKOUT{}".format(n)]       = clkout.clk
         self.specials += Instance("MMCME4_ADV", name=self.name or "", **self.params)
 
     def compute_config(self) -> Dict[str, Any]:
@@ -129,6 +128,9 @@ class USPMMCM(XilinxClocking):
         # CLKFBOUT_MULT_F: 2.0 to 128.0 with step 0.125
         clkfbout_mult_f_values = [x / 8 for x in range(16, 1025)]
 
+        best_config = None
+        best_score  = None
+
         for divclk_divide in range(*self.divclk_divide_range):
             for clkfbout_mult in reversed(clkfbout_mult_f_values):
                 vco_freq = self.clkin_freq * clkfbout_mult / divclk_divide
@@ -140,39 +142,42 @@ class USPMMCM(XilinxClocking):
                     "clkfbout_mult": clkfbout_mult,
                     "vco": vco_freq
                 }
+                errors = []
                 all_valid = True
-                for n, (clk, f, p, m) in sorted(self.clkouts.items()):
-                    valid = False
-
-                    dividers = list(clkdiv_range(*self.clkout_divide_range))
+                for n, clkout in sorted(self.clkouts.items()):
+                    div_ranges = [self.clkout_divide_range]
                     # Add specific range dividers if they exist
                     specific_div_range = getattr(self, f"clkout{n}_divide_range", None)
                     if specific_div_range:
-                        dividers.extend(clkdiv_range(*specific_div_range))
+                        div_ranges.append(specific_div_range)
 
                     # For clkout0, CLKOUT[0]_DIVIDE_F also has range 2.0 to 128.0 with step 0.125
                     if n == 0:
-                        dividers = [x / 8 for x in range(16, 1025)]
+                        div_ranges = [(2, 128 + 1/8, 1/8)]
 
-                    for d in dividers:
-                        clk_freq = vco_freq / d
-                        if not math.isclose(clk_freq, f, rel_tol=m):
-                        # if abs(clk_freq - f) <= f * m:
-                            continue
+                    best_clkout = clkout_best_divider(
+                        clkout.freq,
+                        clkout.margin,
+                        clkdiv_candidates(div_ranges, ideal=vco_freq/clkout.freq),
+                        lambda d: vco_freq/d
+                    )
 
-                        config[f"clkout{n}_freq"] = clk_freq
-                        config[f"clkout{n}_divide"] = d
-                        config[f"clkout{n}_phase"] = p
-                        valid = True
-                        break # Valid divider found
-
-                    if not valid:
+                    if best_clkout is None:
                         all_valid = False
                         break # Exit early if any clock output is invalid
 
+                    error, clk_freq, d = best_clkout
+                    errors.append(error)
+                    config[f"clkout{n}_freq"] = clk_freq
+                    config[f"clkout{n}_divide"] = d
+                    config[f"clkout{n}_phase"] = clkout.phase
+
                 if all_valid:
-                    compute_config_log(self.logger, config)
-                    return config
+                    best_config, best_score = update_best_config(best_config, best_score, config, errors, vco_freq)
+
+        if best_config is not None:
+            compute_config_log(self.logger, best_config)
+            return best_config
 
         raise ValueError("No MMCM config found")
 

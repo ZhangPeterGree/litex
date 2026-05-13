@@ -16,22 +16,47 @@
 
 extern unsigned int _ftext, _edata_rom;
 
+#define BIOS_SECTION_WIDTH 42
 #define NUMBER_OF_BYTES_ON_A_LINE 16
+
+static void print_repeat(char c, int count)
+{
+	for (int i = 0; i < count; i++)
+		putchar(c);
+}
+
+void bios_print_section(const char *name)
+{
+	int fill = BIOS_SECTION_WIDTH - strlen(name) - 6;
+	int left = fill/2;
+	int right = fill - left;
+
+	printf("--");
+	print_repeat('=', left);
+	printf(" \e[1m%s\e[0m ", name);
+	print_repeat('=', right);
+	printf("--\n");
+}
+
+void bios_print_status(const char *label, int success)
+{
+	printf("%s: %s\n", label, success ? "OK" : "failed");
+}
+
 void dump_bytes(unsigned int *ptr, int count, unsigned long addr)
 {
-	uint32_t *dptr = (uint32_t *)ptr;
-	char data[NUMBER_OF_BYTES_ON_A_LINE];
+	unsigned char *dptr = (unsigned char *)ptr;
+	unsigned char data[NUMBER_OF_BYTES_ON_A_LINE];
 	int line_bytes = 0, i = 0;
 
 
 	fputs("Memory dump:", stdout);
 	while (count > 0) {
-		line_bytes =
-			(count > NUMBER_OF_BYTES_ON_A_LINE)?
-				NUMBER_OF_BYTES_ON_A_LINE : count;
-		for (i = 0; i < line_bytes; i+=4){
-			*((uint32_t*)&data[i]) = *(dptr++);
-		}
+			line_bytes =
+				(count > NUMBER_OF_BYTES_ON_A_LINE)?
+					NUMBER_OF_BYTES_ON_A_LINE : count;
+		for (i = 0; i < line_bytes; i++)
+			data[i] = *dptr++;
 
 
 		printf("\n0x%08lx  ", addr);
@@ -92,6 +117,9 @@ int get_param(char *buf, char **cmd, char **params)
 	for (i = 0; i < MAX_PARAM; i++)
 		params[i] = NULL;
 
+	while ((*buf == ' ') && (*buf != 0))
+		buf++;
+
 	*cmd = buf;
 
 	while ((*buf != ' ') && (*buf !=0))
@@ -108,6 +136,9 @@ int get_param(char *buf, char **cmd, char **params)
 
 
 		if (*buf == 0)
+			return nb_param;
+
+		if (nb_param >= MAX_PARAM)
 			return nb_param;
 
 		params[nb_param++] = buf;

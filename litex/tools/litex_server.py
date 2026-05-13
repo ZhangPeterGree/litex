@@ -13,7 +13,6 @@ import argparse
 import os
 import sys
 import socket
-import time
 import threading
 
 from litex.tools.remote.etherbone import EtherbonePacket, EtherboneRecord, EtherboneWrites
@@ -21,7 +20,7 @@ from litex.tools.remote.etherbone import EtherboneIPC
 
 # Read Merger --------------------------------------------------------------------------------------
 
-def _read_merger(addrs, max_length=256, bursts=["incr", "fixed"]):
+def _read_merger(addrs, max_length=255, bursts=None):
     """Sequential reads merger
 
     Take a list of read addresses as input and merge the sequential/fixed reads in (base, length, burst) tuples:
@@ -31,7 +30,19 @@ def _read_merger(addrs, max_length=256, bursts=["incr", "fixed"]):
     most of the access delay and allows minimizing number of commands by grouping them in UARTBone
     packets.
     """
-    assert "incr" in bursts
+    bursts = ["incr", "fixed"] if bursts is None else bursts
+
+    if max_length <= 0:
+        raise ValueError("max_length must be greater than 0.")
+    if "incr" not in bursts:
+        raise ValueError("Read merger requires incr burst support.")
+    for burst in bursts:
+        if burst not in ["incr", "fixed"]:
+            raise ValueError("Unsupported burst mode: {}".format(burst))
+
+    if not addrs:
+        return
+
     burst_base   = addrs[0]
     burst_length = 1
     burst_type   = "incr"
@@ -40,7 +51,7 @@ def _read_merger(addrs, max_length=256, bursts=["incr", "fixed"]):
         # Try to merge to a "fixed" burst if supported
         if ("fixed" in bursts):
             # If current burst matches
-            if (burst_type in [None, "fixed"]) or (burst_length == 1):
+            if (burst_type == "fixed") or (burst_length == 1):
                 # If addr matches
                 if (addr == burst_base):
                     if (burst_length != max_length):
@@ -51,7 +62,7 @@ def _read_merger(addrs, max_length=256, bursts=["incr", "fixed"]):
         # Try to merge to an "incr" burst if supported
         if ("incr" in bursts):
             # If current burst matches
-            if (burst_type in [None, "incr"]) or (burst_length == 1):
+            if (burst_type == "incr") or (burst_length == 1):
                 # If addr matches
                 if (addr == burst_base + (4 * burst_length)):
                     if (burst_length != max_length):
@@ -74,8 +85,18 @@ class RemoteServer(EtherboneIPC):
         self.comm       = comm
         self.bind_ip    = bind_ip
         self.bind_port  = bind_port
-        self.lock       = False
+        self.lock       = threading.Lock()
         self.addr_width = addr_width
+        self.addr_size  = self.addr_width // 8
+
+        comm_name = comm.__class__.__name__
+        self.read_max_length = {
+            "CommUART": 255,
+            "CommUDP":    1,
+        }.get(comm_name, 1)
+        self.read_bursts = {
+            "CommUART": ["incr", "fixed"]
+        }.get(comm_name, ["incr"])
 
     def open(self):
         if hasattr(self, "socket"):
@@ -116,7 +137,7 @@ class RemoteServer(EtherboneIPC):
                 while True:
                     # Receive packet.
                     try:
-                        packet = self.receive_packet(client_socket, self.addr_width // 8)
+                        packet = self.receive_packet(client_socket, self.addr_size)
                         if packet == 0:
                             break
                     except Exception:
@@ -129,42 +150,27 @@ class RemoteServer(EtherboneIPC):
                     record = packet.records.pop()
 
                     # Hardware lock/reservation.
-                    while self.lock:
-                        time.sleep(0.01)
-                    self.lock = True
-
-                    try:
+                    with self.lock:
                         # Handle Etherbone writes.
                         if record.writes != None:
                             self.comm.write(record.writes.base_addr, record.writes.get_datas())
 
                         # Handle Etherbone reads.
                         if record.reads != None:
-                            max_length = {
-                                "CommUART": 256,
-                                "CommUDP":    1,
-                            }.get(self.comm.__class__.__name__, 1)
-                            bursts = {
-                                "CommUART": ["incr", "fixed"]
-                            }.get(self.comm.__class__.__name__, ["incr"])
                             reads = []
                             for addr, length, burst in _read_merger(record.reads.get_addrs(),
-                                max_length  = max_length,
-                                bursts      = bursts):
-                                reads += self.comm.read(addr, length, burst)
+                                max_length  = self.read_max_length,
+                                bursts      = self.read_bursts):
+                                reads.extend(self.comm.read(addr, length, burst))
 
-                            addr_size = self.addr_width // 8
-                            record = EtherboneRecord(addr_size)
-                            record.writes = EtherboneWrites(addr_size=addr_size, datas=reads)
+                            record = EtherboneRecord(self.addr_size)
+                            record.writes = EtherboneWrites(addr_size=self.addr_size, datas=reads)
                             record.wcount = len(record.writes)
 
                             packet = EtherbonePacket(self.addr_width)
                             packet.records = [record]
                             packet.encode()
                             self.send_packet(client_socket, packet)
-                    finally:
-                        # Release hardware lock.
-                        self.lock = False
 
             finally:
                 print("Disconnect")

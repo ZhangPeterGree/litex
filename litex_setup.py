@@ -9,10 +9,12 @@
 import os
 import sys
 import time
+import shlex
 import shutil
 import argparse
 import importlib
 import subprocess
+import sysconfig
 import urllib.request
 
 start_time   = time.time()
@@ -45,6 +47,7 @@ def print_banner():
     b.append("       /____/_/\\__/\\__/_/|_|         ")
     b.append("     Build your hardware, easily!      ")
     b.append("          LiteX Setup utility.         ")
+    b.append(" Copyright 2012-2026 / Enjoy-Digital & LiteX developers")
     b.append("")
     print("\n".join(b))
 
@@ -211,9 +214,19 @@ def git_status(repo_path, short=False):
         return None
     return r.stdout.decode("UTF-8", errors="ignore").strip()
 
+def git_status_has_tracked_changes(status):
+    if not status:
+        return False
+    for line in status.splitlines():
+        if len(line) < 2:
+            continue
+        if line[:2] != "??":
+            return True
+    return False
+
 def git_confirm_update_with_local_changes(name, repo_path):
     status = git_status(repo_path, short=True)
-    if not status or not sys.stdin.isatty():
+    if not git_status_has_tracked_changes(status) or not sys.stdin.isatty():
         return
     print_warning(f"{name} Git repository has local changes.")
     print_status("Updating can fail if these changes overlap with upstream changes.")
@@ -377,8 +390,10 @@ def litex_setup_update_repos(config="standard", tag=None):
 
 # Git repositories install -------------------------------------------------------------------------
 
-def pip_install_cmd(packages, user_mode=False, editable=False):
+def pip_install_cmd(packages, user_mode=False, editable=False, no_build_isolation=False):
     pip_cmd = [sys.executable, "-m", "pip", "install"]
+    if no_build_isolation:
+        pip_cmd.append("--no-build-isolation")
     if editable:
         pip_cmd.append("--editable")
     pip_cmd += packages
@@ -386,16 +401,109 @@ def pip_install_cmd(packages, user_mode=False, editable=False):
         pip_cmd.append("--user")
     return pip_cmd
 
-def _pip_install(packages, user_mode=False, editable=False):
-    pip_cmd = pip_install_cmd(packages, user_mode=user_mode, editable=editable)
-    subprocess.check_call(pip_cmd)
+def pip_install_in_virtualenv():
+    return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
 
-def pip_install_error(description, packages, user_mode=False, editable=False):
+def pip_install_externally_managed():
+    if pip_install_in_virtualenv():
+        return False
+    marker = os.path.join(sysconfig.get_path("stdlib"), "EXTERNALLY-MANAGED")
+    return os.path.exists(marker)
+
+def pip_install_externally_managed_error(user_mode=False):
+    print_error("This Python environment is externally managed (PEP 668).")
+    print_status("LiteX Setup will not override the system package manager by default.")
+    print_status("Recommended options:")
+    print_status("  python3 -m venv ~/litex-venv")
+    print_status("  source ~/litex-venv/bin/activate")
+    print_status("  ./litex_setup.py --init --install")
+    if user_mode:
+        print_status("On recent Debian/Ubuntu releases, --user installs are also blocked outside a venv.")
+    print_status("If you knowingly want pip's override, rerun with --break-system-packages.")
+
+def pip_install_externally_managed_check(user_mode=False, break_system_packages=False):
+    if pip_install_externally_managed() and not break_system_packages:
+        pip_install_externally_managed_error(user_mode=user_mode)
+        raise SetupError
+
+def pip_install_pythonpath(source_path=None):
+    if source_path is None:
+        return None
+    pythonpath = os.environ.get("PYTHONPATH")
+    if pythonpath:
+        return os.pathsep.join([source_path, pythonpath])
+    return source_path
+
+def pip_install_env(source_path=None):
+    pythonpath = pip_install_pythonpath(source_path)
+    if pythonpath is None:
+        return None
+    env = os.environ.copy()
+    env["PYTHONPATH"] = pythonpath
+    return env
+
+def pip_install_cmd_str(
+    packages,
+    user_mode=False,
+    editable=False,
+    no_build_isolation=False,
+    source_path=None,
+    break_system_packages=False,
+):
+    pip_cmd = pip_install_cmd(
+        packages,
+        user_mode          = user_mode,
+        editable           = editable,
+        no_build_isolation = no_build_isolation,
+    )
+    if break_system_packages:
+        pip_cmd.append("--break-system-packages")
+    cmd = " ".join(shlex.quote(str(arg)) for arg in pip_cmd)
+    pythonpath = pip_install_pythonpath(source_path)
+    if pythonpath is not None:
+        cmd = f"PYTHONPATH={shlex.quote(pythonpath)} {cmd}"
+    return cmd
+
+def _pip_install(
+    packages,
+    user_mode=False,
+    editable=False,
+    no_build_isolation=False,
+    source_path=None,
+    break_system_packages=False,
+):
+    pip_cmd = pip_install_cmd(
+        packages,
+        user_mode          = user_mode,
+        editable           = editable,
+        no_build_isolation = no_build_isolation,
+    )
+    if break_system_packages:
+        pip_cmd.append("--break-system-packages")
+    subprocess.check_call(pip_cmd, env=pip_install_env(source_path))
+
+def pip_install_error(
+    description,
+    packages,
+    user_mode=False,
+    editable=False,
+    no_build_isolation=False,
+    source_path=None,
+    break_system_packages=False,
+):
     print_error(f"{description} could not be installed.")
     print_status("Try:")
-    print_status(f"  {' '.join(pip_install_cmd(packages, user_mode=user_mode, editable=editable))}")
+    pip_cmd = pip_install_cmd_str(
+        packages,
+        user_mode          = user_mode,
+        editable           = editable,
+        no_build_isolation = no_build_isolation,
+        source_path        = source_path,
+        break_system_packages = break_system_packages,
+    )
+    print_status(f"  {pip_cmd}")
 
-def litex_setup_install_repos(config="standard", user_mode=False):
+def litex_setup_install_repos(config="standard", user_mode=False, break_system_packages=False):
     print_status("Installing Git repositories...", underline=True)
     for name in install_configs[config]:
         repo = git_repos[name]
@@ -408,14 +516,28 @@ def litex_setup_install_repos(config="standard", user_mode=False):
                 print_error(f"{name} Git repository is not initialized, please run --init first.")
                 raise SetupError
             os.chdir(repo_path)
+            pip_install_externally_managed_check(
+                user_mode             = user_mode,
+                break_system_packages = break_system_packages,
+            )
             try:
-                _pip_install(["."], user_mode=user_mode, editable=repo.editable)
+                _pip_install(
+                    ["."],
+                    user_mode          = user_mode,
+                    editable           = repo.editable,
+                    no_build_isolation = True,
+                    source_path        = repo_path,
+                    break_system_packages = break_system_packages,
+                )
             except subprocess.CalledProcessError:
                 pip_install_error(
                     f"{name} Git repository",
                     ["."],
-                    user_mode = user_mode,
-                    editable  = repo.editable,
+                    user_mode          = user_mode,
+                    editable           = repo.editable,
+                    no_build_isolation = True,
+                    source_path        = repo_path,
+                    break_system_packages = break_system_packages,
                 )
                 raise SetupError
 
@@ -433,17 +555,31 @@ def litex_setup_install_repos(config="standard", user_mode=False):
         ]
 
         print_status("Installing optional LUNA ACM Python dependencies...")
+        pip_install_externally_managed_check(
+            user_mode             = user_mode,
+            break_system_packages = break_system_packages,
+        )
         try:
-            _pip_install(luna_packages, user_mode=user_mode)
+            _pip_install(luna_packages, user_mode=user_mode, break_system_packages=break_system_packages)
         except subprocess.CalledProcessError:
-            pip_install_error("Optional LUNA ACM dependencies", luna_packages, user_mode=user_mode)
+            pip_install_error(
+                "Optional LUNA ACM dependencies",
+                luna_packages,
+                user_mode=user_mode,
+                break_system_packages=break_system_packages,
+            )
             print_status("USB ACM via LUNA may not be usable until dependencies are installed manually.")
 
         print_status("Installing optional Amaranth CPU Python dependencies...")
         try:
-            _pip_install(amaranth_packages, user_mode=user_mode)
+            _pip_install(amaranth_packages, user_mode=user_mode, break_system_packages=break_system_packages)
         except subprocess.CalledProcessError:
-            pip_install_error("Optional Amaranth CPU dependencies", amaranth_packages, user_mode=user_mode)
+            pip_install_error(
+                "Optional Amaranth CPU dependencies",
+                amaranth_packages,
+                user_mode=user_mode,
+                break_system_packages=break_system_packages,
+            )
             print_status(
                 "Amaranth-based CPUs (ex: Minerva/Sentinel) may not be usable "
                 "until dependencies are installed manually."
@@ -662,6 +798,8 @@ def main():
     parser.add_argument("--update",    action="store_true", help="Update Git repositories.")
     parser.add_argument("--install",   action="store_true", help="Install Git repositories.")
     parser.add_argument("--user",      action="store_true", help="Install in User-Mode.")
+    parser.add_argument("--break-system-packages", action="store_true",
+        help="Pass pip's --break-system-packages option when installing outside a virtual environment.")
     parser.add_argument("--config",    default="standard",  help="Install config (minimal, standard, full).")
     parser.add_argument("--tag",       default=None,        help="Use version from release tag.")
 
@@ -709,7 +847,11 @@ def main():
 
     # Install.
     if args.install:
-        litex_setup_install_repos(config=args.config, user_mode=args.user)
+        litex_setup_install_repos(
+            config                = args.config,
+            user_mode             = args.user,
+            break_system_packages = args.break_system_packages,
+        )
 
     # Freeze.
     if args.freeze:

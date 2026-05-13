@@ -10,8 +10,6 @@ from migen.genlib.resetsync import AsyncResetSynchronizer
 
 from litex.gen import *
 
-from litex.build.io import DifferentialInput
-
 from litex.soc.interconnect.csr import *
 
 from litex.soc.cores.clock.common import *
@@ -21,6 +19,7 @@ from litex.soc.cores.clock.common import *
 class XilinxClocking(LiteXModule):
 
     def __init__(self, vco_margin=0):
+        check_margin(vco_margin, "VCO margin")
         self.clkfbout_mult_frange = (2,  64+1)
         self.clkout_divide_range  = (1, 128+1)
         self.vco_margin = vco_margin
@@ -35,22 +34,20 @@ class XilinxClocking(LiteXModule):
         self.params     = {}
 
     def register_clkin(self, clkin, freq):
-        self.clkin = Signal()
-        if isinstance(clkin, (Signal, ClockSignal)):
-            self.comb += self.clkin.eq(clkin)
-        elif isinstance(clkin, Record):
-            self.specials += DifferentialInput(clkin.p, clkin.n, self.clkin)
-        else:
-            raise ValueError
+        check_freq_range(freq, self.clkin_freq_range, "Input clock frequency")
+        self.clkin = connect_clkin(self, clkin, differential=True)
         self.clkin_freq = freq
         register_clkin_log(self.logger, clkin, freq)
 
     def create_clkout(self, cd, freq, phase=0, buf="bufg", margin=1e-2, with_reset=True, reset_buf=None, ce=None):
-        assert self.nclkouts < self.nclkouts_max
+        check_freq_positive(freq, "Output clock frequency")
+        check_margin(margin)
+        check_clkout_count(self.nclkouts, self.nclkouts_max)
         clkout = Signal()
-        self.clkouts[self.nclkouts] = (clkout, freq, phase, margin)
+        self.clkouts[self.nclkouts] = ClkOut(clkout, freq, phase, margin)
         if with_reset:
-            assert reset_buf in [None, "bufg"]
+            if reset_buf not in [None, "bufg"]:
+                raise ValueError("Unsupported reset clock buffer: {}".format(reset_buf))
             cd.rst_buf = reset_buf # FIXME: Improve.
             self.specials += AsyncResetSynchronizer(cd, ~self.locked)
         if buf is None:
@@ -77,41 +74,47 @@ class XilinxClocking(LiteXModule):
         self.nclkouts += 1
 
     def compute_config(self):
-        config = {}
+        check_clkin_registered(hasattr(self, "clkin"))
+        check_clkouts(self.nclkouts)
+        best_config = None
+        best_score  = None
         for divclk_divide in range(*self.divclk_divide_range):
-            config["divclk_divide"] = divclk_divide
             for clkfbout_mult in reversed(list(clkdiv_range(*self.clkfbout_mult_frange))): # Reverse to use highest VCO frequency.
                 all_valid = True
-                vco_freq = self.clkin_freq*clkfbout_mult/divclk_divide
+                errors    = []
+                config    = {"divclk_divide": divclk_divide}
+                vco_freq  = self.clkin_freq*clkfbout_mult/divclk_divide
                 (vco_freq_min, vco_freq_max) = self.vco_freq_range
                 if (vco_freq >= vco_freq_min*(1 + self.vco_margin) and
                     vco_freq <= vco_freq_max*(1 - self.vco_margin)):
-                    for n, (clk, f, p, m) in sorted(self.clkouts.items()):
-                        valid = False
+                    for n, clkout in sorted(self.clkouts.items()):
                         d_ranges = [self.clkout_divide_range]
                         if getattr(self, "clkout{}_divide_range".format(n), None) is not None:
                             d_ranges += [getattr(self, "clkout{}_divide_range".format(n))]
-                        for d_range in d_ranges:
-                            for d in clkdiv_range(*d_range):
-                                clk_freq = vco_freq/d
-                                if abs(clk_freq - f) <= f*m:
-                                    config["clkout{}_freq".format(n)]   = clk_freq
-                                    config["clkout{}_divide".format(n)] = d
-                                    config["clkout{}_phase".format(n)]  = p
-                                    valid = True
-                                    break
-                                if valid:
-                                    break
-                        if not valid:
+                        best_clkout = clkout_best_divider(
+                            clkout.freq,
+                            clkout.margin,
+                            clkdiv_candidates(d_ranges, ideal=vco_freq/clkout.freq),
+                            lambda d: vco_freq/d
+                        )
+                        if best_clkout is None:
                             all_valid = False
+                            break
+                        error, clk_freq, d = best_clkout
+                        errors.append(error)
+                        config["clkout{}_freq".format(n)]   = clk_freq
+                        config["clkout{}_divide".format(n)] = d
+                        config["clkout{}_phase".format(n)]  = clkout.phase
                 else:
                     all_valid = False
                 if all_valid:
                     config["vco"]           = vco_freq
                     config["clkfbout_mult"] = clkfbout_mult
-                    compute_config_log(self.logger, config)
-                    return config
-        raise ValueError("No PLL config found")
+                    best_config, best_score = update_best_config(best_config, best_score, config, errors, vco_freq)
+        if best_config is not None:
+            compute_config_log(self.logger, best_config)
+            return best_config
+        raise pll_config_error(self.clkin_freq, self.clkouts)
 
     def expose_drp(self):
         self.drp_reset  = CSR()
@@ -151,6 +154,9 @@ class XilinxClocking(LiteXModule):
         self.logger.info("Exposing Dynamic Reconfiguration Port (DRP) interface.")
 
     def expose_dps(self, clk_domain="sys", with_csr=True):
+        if with_csr and clk_domain != "sys":
+            raise ValueError("CSR-backed DPS must use the sys clock domain.")
+
         self.psen     = Signal() # i.
         self.psincdec = Signal() # i.
         self.psdone   = Signal() # o.
@@ -163,7 +169,6 @@ class XilinxClocking(LiteXModule):
         )
 
         if with_csr:
-            assert clk_domain == "sys"
             self.dps_psen     = CSRStorage(description="DPS phase-shift enable.")
             self.dps_psincdec = CSRStorage(description="DPS phase-shift direction.")
             self.dps_psdone   = CSRStatus(description="DPS phase-shift done.")
@@ -193,5 +198,5 @@ class XilinxClocking(LiteXModule):
             self.reset = reset
 
     def do_finalize(self):
-        assert hasattr(self, "clkin")
+        check_clkin_registered(hasattr(self, "clkin"))
         self.add_reset_delay(cycles=8) # Prevents interlock when reset driven from sys_clk.

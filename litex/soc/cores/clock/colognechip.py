@@ -6,7 +6,6 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 from migen import *
-from migen.genlib.resetsync import AsyncResetSynchronizer
 
 from litex.gen import *
 
@@ -38,9 +37,12 @@ class GateMatePLL(LiteXModule):
         lock_req   = 1,
         name       = None):
 
-        assert perf_mode.lower() in ["undefined", "lowpower", "economy", "speed"]
-        assert low_jitter in [0, 1]
-        assert lock_req in [0, 1]
+        if not isinstance(perf_mode, str) or perf_mode.lower() not in ["undefined", "lowpower", "economy", "speed"]:
+            raise ValueError("Unsupported PLL performance mode: {}.".format(perf_mode))
+        if low_jitter not in [0, 1]:
+            raise ValueError("PLL low_jitter must be 0 or 1.")
+        if lock_req not in [0, 1]:
+            raise ValueError("PLL lock_req must be 0 or 1.")
 
         self.logger      = logging.getLogger("CC_PLL")
         self.reset       = Signal()
@@ -71,12 +73,9 @@ class GateMatePLL(LiteXModule):
         usr_clk_ref: bool
             select if clkin is connected to CLK_REF or USR_CLK_REF
         """
+        check_freq_positive(freq, "Input clock frequency")
         self._usr_clk_ref = usr_clk_ref
-        self._clkin = Signal()
-        if isinstance(clkin, (Signal, ClockSignal)):
-            self.comb += self._clkin.eq(clkin)
-        else:
-            raise ValueError
+        self._clkin = connect_clkin(self, clkin)
         self._clkin_freq = freq
         register_clkin_log(self.logger, clkin, freq)
 
@@ -94,20 +93,21 @@ class GateMatePLL(LiteXModule):
         with_reset: bool
             drive cd reset
         """
-        assert phase in [0, 90, 180, 270]
-        assert phase not in self._clkouts
-        assert freq <= self._max_freq
+        check_phase_allowed(phase, [0, 90, 180, 270])
+        if phase in self._clkouts:
+            raise ValueError("Output clock phase {} is already used.".format(phase))
+        check_freq_range(freq, (0, self._max_freq), "Output clock frequency")
 
         clkout = Signal()
         self._clkouts[phase] = (clkout, freq)
-        if with_reset:
-            self.specials += AsyncResetSynchronizer(cd, ~self.locked)
-        self.comb += cd.clk.eq(clkout)
+        connect_clkout(self, cd, clkout, reset=~self.locked, with_reset=with_reset)
         create_clkout_log(self.logger, cd.name, freq, 0, phase)
 
     def do_finalize(self):
-        assert hasattr(self, "_clkin")
-        assert len(self._clkouts) > 0
+        if not hasattr(self, "_clkin"):
+            raise ValueError("Input clock frequency has not been registered.")
+        if len(self._clkouts) == 0:
+            raise ValueError("At least one output clock must be registered.")
 
         # set/unset frequency doubler for CLK180/CLK270
         clk_doub    = {180:0, 270:0}
@@ -120,15 +120,19 @@ class GateMatePLL(LiteXModule):
             if freq != 0:
                 # clk0 and clk90 frequency must be equal to clkout freq
                 if phase in [0, 90]:
-                    assert freq == clkout_freq
+                    if freq != clkout_freq:
+                        raise ValueError(
+                            "CLK{} frequency must be equal to base output frequency.".format(phase)
+                        )
                 else:
                     # clk180 and clk270 must be x1 or x2 clkout frequency
-                    assert freq in [clkout_freq, 2 * clkout_freq]
+                    if freq not in [clkout_freq, 2 * clkout_freq]:
+                        raise ValueError(
+                            "CLK{} frequency must be equal to or twice base output frequency.".format(phase)
+                        )
                     # when clk180 or clk270 == x2 clkout: CLKxx_DOUB must be set
                     if freq == 2 * clkout_freq:
                         clk_doub[phase] = 1
-
-        assert clkout_freq is not None
 
         freqInMHz  = self._clkin_freq/1e6
         freqOutMHz = clkout_freq/1e6

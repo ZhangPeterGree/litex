@@ -31,12 +31,35 @@ Features:
 - Optional CSR interface for configuration.
 """
 
+HYPERRAM_LATENCIES     = list(range(3, 8))
+HYPERRAM_LATENCY_MODES = ["fixed", "variable"]
+HYPERRAM_CLK_RATIOS    = ["4:1", "2:1"]
+
+
+def check_hyperram_latency(latency):
+    if latency not in HYPERRAM_LATENCIES:
+        raise ValueError("Unsupported HyperRAM latency: {}.".format(latency))
+
+
 # HyperRAM Layout ----------------------------------------------------------------------------------
+
+def _check_hyperram_layout_width(data_width):
+    if data_width not in [8, 16]:
+        raise ValueError("HyperRAM only supports 8-bit or 16-bit data buses.")
+
+
+def _get_signal_width(signal):
+    try:
+        return len(signal)
+    except TypeError:
+        return 1
+
 
 # IOs.
 # ----
-def hyperam_ios_layout(data_width=8):
+def hyperram_ios_layout(data_width=8):
     """IO layout for HyperRAM PHY."""
+    _check_hyperram_layout_width(data_width)
     return [
         ("rst_n",   1),
         ("clk",     1),
@@ -49,10 +72,13 @@ def hyperam_ios_layout(data_width=8):
         ("rwds_i",  data_width//8),
     ]
 
+hyperam_ios_layout = hyperram_ios_layout
+
 # PHY.
 # ----
 def hyperram_phy_tx_layout(data_width=8):
     """Transmit layout for HyperRAM PHY."""
+    _check_hyperram_layout_width(data_width)
     return [
         ("cmd",     1),
         ("dat_w",   1),
@@ -65,6 +91,7 @@ def hyperram_phy_tx_layout(data_width=8):
 
 def hyperram_phy_rx_layout(data_width=8):
     """Receive layout for HyperRAM PHY."""
+    _check_hyperram_layout_width(data_width)
     return [
         ("dq", data_width),
     ]
@@ -135,14 +162,13 @@ class HyperRAMSDRPHY(LiteXModule):
         self.data_width = data_width = self.get_data_width(pads)
         self.sink       =       sink = stream.Endpoint(hyperram_phy_tx_layout(data_width)) # TX.
         self.source     =     source = stream.Endpoint(hyperram_phy_rx_layout(data_width)) # RX.
-        self.ios        =        ios = Record(hyperam_ios_layout(data_width))              # IOs.
+        self.ios        =        ios = Record(hyperram_ios_layout(data_width))             # IOs.
 
         # # #
 
         # Parameters.
         # -----------
-        if data_width not in [8, 16]:
-            raise ValueError("HyperRAM PHY only supports 8-bit or 16-bit data buses.")
+        _check_hyperram_layout_width(data_width)
 
         # Clk Gen.
         # --------
@@ -203,14 +229,44 @@ class HyperRAMSDRPHY(LiteXModule):
 
     def get_data_width(self, pads):
         """Returns data width based on pads."""
-        if not hasattr(pads.dq, "oe"):
-            return len(pads.dq)
+        if hasattr(pads, "dq"):
+            if hasattr(pads.dq, "oe"):
+                data_width = _get_signal_width(pads.dq.o)
+            else:
+                data_width = _get_signal_width(pads.dq)
+        elif all(hasattr(pads, name) for name in ["dq_o", "dq_i", "dq_oe"]):
+            data_width = _get_signal_width(pads.dq_o)
+            if _get_signal_width(pads.dq_i) != data_width:
+                raise ValueError("HyperRAM DQ input/output widths must match.")
         else:
-            return len(pads.dq.o)
+            raise ValueError("HyperRAM pads must provide dq or dq_o/dq_i/dq_oe signals.")
+
+        if hasattr(pads, "rwds"):
+            if hasattr(pads.rwds, "oe"):
+                rwds_width = _get_signal_width(pads.rwds.o)
+            else:
+                rwds_width = _get_signal_width(pads.rwds)
+        elif all(hasattr(pads, name) for name in ["rwds_o", "rwds_i", "rwds_oe"]):
+            rwds_width = _get_signal_width(pads.rwds_o)
+            if _get_signal_width(pads.rwds_i) != rwds_width:
+                raise ValueError("HyperRAM RWDS input/output widths must match.")
+        else:
+            raise ValueError("HyperRAM pads must provide rwds or rwds_o/rwds_i/rwds_oe signals.")
+
+        if rwds_width != data_width//8:
+            raise ValueError("HyperRAM RWDS width must be data_width/8.")
+        return data_width
 
     def connect_to_pads(self, pads, dq_i_cd):
         """Connects PHY signals to external pads."""
-        with_tristate = not hasattr(pads, "dq_oe") and not hasattr(pads, "rwds_oe")
+        with_tristate = hasattr(pads, "dq") and hasattr(pads, "rwds") and \
+            not hasattr(pads, "dq_oe") and not hasattr(pads, "rwds_oe")
+        with_split_io = all(hasattr(pads, name) for name in [
+            "dq_o",   "dq_i",   "dq_oe",
+            "rwds_o", "rwds_i", "rwds_oe",
+        ])
+        if not (with_tristate or with_split_io):
+            raise ValueError("HyperRAM pads must use tristate or split input/output signals.")
 
         # CS.
         # ---
@@ -226,11 +282,13 @@ class HyperRAMSDRPHY(LiteXModule):
         if hasattr(pads, "clk"):
             self.specials += MultiReg(i=self.ios.clk & ClockSignal("hyperram"), o=pads.clk, n=3)
         # Differential Clk.
-        elif hasattr(pads, "clk_p"):
+        elif hasattr(pads, "clk_p") and hasattr(pads, "clk_n"):
             self.specials += MultiReg(i=  self.ios.clk & ClockSignal("hyperram"),  o=pads.clk_p, n=3)
             self.specials += MultiReg(i=~(self.ios.clk & ClockSignal("hyperram")), o=pads.clk_n, n=3)
+        elif hasattr(pads, "clk_p") or hasattr(pads, "clk_n"):
+            raise ValueError("HyperRAM differential clock pads must provide clk_p and clk_n.")
         else:
-            raise ValueError
+            raise ValueError("HyperRAM pads must provide clk or clk_p/clk_n.")
 
         # DQ Output/Input.
         # ----------------
@@ -254,7 +312,7 @@ class HyperRAMSDRPHY(LiteXModule):
                 MultiReg(o=self.ios.dq_i[n], i=dq_i[n], n=1, odomain=dq_i_cd),
             ]
 
-        # RDWS Output/Input.
+        # RWDS Output/Input.
         # ------------------
         if with_tristate:
             rwds_o  = Signal(self.data_width//8)
@@ -300,6 +358,12 @@ class HyperRAMCore(LiteXModule):
         self.sink   = sink   = stream.Endpoint(hyperram_phy_rx_layout(phy.data_width)) # RX.
 
         # # #
+
+        check_hyperram_latency(latency)
+        if latency_mode not in HYPERRAM_LATENCY_MODES:
+            raise ValueError("Unsupported HyperRAM latency mode: {}.".format(latency_mode))
+        if clk_ratio not in HYPERRAM_CLK_RATIOS:
+            raise ValueError("Unsupported HyperRAM clock ratio: {}.".format(clk_ratio))
 
         # Config/Reg Interface.
         # ---------------------
@@ -469,7 +533,7 @@ class HyperRAMCore(LiteXModule):
         # Data Write State.
         self.sync += [
             If(bus_latch,
-                bus_cti.eq(bus_cti),
+                bus_cti.eq(bus.cti),
                 bus_we.eq(bus.we),
                 bus_sel.eq(bus.sel),
                 bus_adr.eq(bus.adr),
@@ -564,11 +628,12 @@ class HyperRAM(LiteXModule):
 
         # Parameters.
         # -----------
+        check_hyperram_latency(latency)
         self.pads      = pads
         self.clk_ratio = clk_ratio
-        if latency_mode not in ["fixed", "variable"]:
+        if latency_mode not in HYPERRAM_LATENCY_MODES:
             raise ValueError("Unsupported HyperRAM latency mode: {}.".format(latency_mode))
-        if clk_ratio not in ["4:1", "2:1"]:
+        if clk_ratio not in HYPERRAM_CLK_RATIOS:
             raise ValueError("Unsupported HyperRAM clock ratio: {}.".format(clk_ratio))
 
         # PHY.

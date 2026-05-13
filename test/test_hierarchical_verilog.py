@@ -2,6 +2,8 @@ import unittest
 import re
 
 from migen import *
+from migen.fhdl.decorators import ClockDomainsRenamer
+from migen.fhdl.specials import Tristate
 
 from litex.gen import LiteXContext
 from litex.gen.fhdl.hierarchy import LiteXHierarchyExplorer
@@ -23,7 +25,120 @@ class _Top(Module):
         self.specials += Instance("MY_BB")
 
 
+class _TristateLeaf(Module):
+    def __init__(self, pad):
+        self.o  = Signal(name="leaf_o")
+        self.oe = Signal(name="leaf_oe")
+        self.i  = Signal(name="leaf_i")
+
+        self.comb += [
+            self.o.eq(1),
+            self.oe.eq(self.i),
+        ]
+        self.specials += Tristate(pad, self.o, self.oe, self.i)
+
+
+class _TristateTop(Module):
+    def __init__(self):
+        self.pad = Signal(name="pad")
+        self.submodules.leaf = _TristateLeaf(self.pad)
+
+
+class _SharedLeaf(Module):
+    def __init__(self, shared):
+        self.o = Signal(name="leaf_o")
+        self.comb += self.o.eq(shared)
+
+
+class _SharedTop(Module):
+    def __init__(self):
+        self.dummy  = Signal(name="dummy")
+        self.shared = Signal(name="shared")
+        self.submodules.leaf = _SharedLeaf(self.shared)
+
+
+class _InlineFSMLeaf(Module):
+    def __init__(self):
+        self.o = Signal(name="fsm_o")
+        self.submodules.fsm = FSM(reset_state="IDLE")
+        self.comb += self.o.eq(0)
+        self.fsm.act("IDLE",
+            NextState("RUN"),
+        )
+        self.fsm.act("RUN",
+            self.o.eq(1),
+            NextState("RUN"),
+        )
+
+
+class _InlineFSMTop(Module):
+    def __init__(self):
+        self.o = Signal(name="o")
+        self.submodules.leaf = _InlineFSMLeaf()
+        self.comb += self.o.eq(self.leaf.o)
+
+
+class _ClockRenamedInlineFSMTop(Module):
+    def __init__(self):
+        self.clock_domains.cd_eth_tx = ClockDomain("eth_tx")
+        self.o = Signal(name="o")
+        self.submodules.leaf = ClockDomainsRenamer("eth_tx")(_InlineFSMLeaf())
+        self.comb += self.o.eq(self.leaf.o)
+
+
+class _MemoryLeaf(Module):
+    def __init__(self):
+        self.o = Signal(8, name="mem_o")
+        mem = Memory(8, 4, init=[0x12, 0x34, 0x56, 0x78])
+        port = mem.get_port()
+        self.specials += mem
+        self.comb += [
+            port.adr.eq(0),
+            self.o.eq(port.dat_r),
+        ]
+
+
+class _MemoryTop(Module):
+    def __init__(self):
+        self.o = Signal(8, name="o")
+        self.submodules.leaf = _MemoryLeaf()
+        self.comb += self.o.eq(self.leaf.o)
+
+
+class _SharedMemoryOwner(Module):
+    def __init__(self, mem):
+        self.specials += mem
+
+
+class _SharedMemoryReader(Module):
+    def __init__(self, mem, adr):
+        self.dat_r = Signal(8, name="shared_mem_dat_r")
+        port = mem.get_port()
+        self.specials += mem
+        self.comb += [
+            port.adr.eq(adr),
+            self.dat_r.eq(port.dat_r),
+        ]
+
+
+class _SharedMemoryTop(Module):
+    def __init__(self):
+        self.adr = Signal(2, name="adr")
+        self.o = Signal(8, name="o")
+        mem = Memory(8, 4, init=[0x12, 0x34, 0x56, 0x78])
+        self.submodules.owner = _SharedMemoryOwner(mem)
+        self.submodules.reader = _SharedMemoryReader(mem, self.adr)
+        self.comb += self.o.eq(self.reader.dat_r)
+
+
 class TestHierarchicalVerilog(unittest.TestCase):
+    @staticmethod
+    def _module_body(verilog, name):
+        match = re.search(rf"module {name} \(.*?endmodule", verilog, re.S)
+        if match is None:
+            raise AssertionError(f"module {name} not found")
+        return match.group(0)
+
     def test_hierarchy_golden_text(self):
         expected = "\n".join([
             "_Top",
@@ -68,3 +183,116 @@ class TestHierarchicalVerilog(unittest.TestCase):
         # Hierarchical mode should emit child module and submodule instantiation.
         self.assertIn("module top__leaf", hier)
         self.assertIn("top__leaf leaf", hier)
+
+    def test_hierarchical_tristate_keeps_child_controls_local(self):
+        top = _TristateTop()
+
+        old_top = LiteXContext.top
+        try:
+            LiteXContext.top = top
+            verilog = convert(top, ios={top.pad}, name="top", hierarchical=True).main_source
+        finally:
+            LiteXContext.top = old_top
+
+        leaf_module = self._module_body(verilog, "top__leaf")
+        top_module  = self._module_body(verilog, "top")
+
+        self.assertRegex(leaf_module, r"inout\s+wire\s+pad")
+        self.assertNotRegex(leaf_module.split(");", 1)[0], r"leaf_[ioe]")
+        self.assertRegex(leaf_module, r"wire\s+leaf_i;")
+        self.assertRegex(leaf_module, r"wire\s+leaf_o;")
+        self.assertRegex(leaf_module, r"wire\s+leaf_oe;")
+        self.assertIn("assign pad = leaf_oe ? leaf_o : 1'bz;", leaf_module)
+        self.assertIn("assign leaf_i = pad;", leaf_module)
+
+        self.assertIn(".pad(pad)", top_module)
+        self.assertNotIn("leaf_i", top_module)
+        self.assertNotIn("leaf_o", top_module)
+        self.assertNotIn("leaf_oe", top_module)
+
+    def test_hierarchical_parent_signal_used_by_child_is_port(self):
+        leaf = _SharedTop()
+
+        old_top = LiteXContext.top
+        try:
+            LiteXContext.top = leaf
+            verilog = convert(leaf, ios={leaf.dummy}, name="top", hierarchical=True).main_source
+        finally:
+            LiteXContext.top = old_top
+
+        leaf_module = self._module_body(verilog, "top__leaf")
+        top_module  = self._module_body(verilog, "top")
+
+        self.assertRegex(leaf_module, r"input\s+wire\s+shared")
+        self.assertIn(".shared(shared)", top_module)
+
+    def test_hierarchical_inline_child_statements_are_not_duplicated(self):
+        top = _InlineFSMTop()
+
+        old_top = LiteXContext.top
+        try:
+            LiteXContext.top = top
+            verilog = convert(top, ios={top.o}, name="top", hierarchical=True).main_source
+        finally:
+            LiteXContext.top = old_top
+
+        leaf_module = self._module_body(verilog, "top__leaf")
+        top_module  = self._module_body(verilog, "top")
+
+        self.assertEqual(leaf_module.count("case (state)"), 1)
+        self.assertEqual(leaf_module.count("always @(posedge sys_clk)"), 1)
+        self.assertIn(".fsm_o(fsm_o)", top_module)
+        self.assertNotIn(".state(state)", top_module)
+        self.assertNotIn(".next_state(next_state)", top_module)
+
+    def test_hierarchical_inline_child_preserves_renamed_clock_domain(self):
+        top = _ClockRenamedInlineFSMTop()
+
+        old_top = LiteXContext.top
+        try:
+            LiteXContext.top = top
+            verilog = convert(top, ios={top.o}, name="top", hierarchical=True).main_source
+        finally:
+            LiteXContext.top = old_top
+
+        leaf_module = self._module_body(verilog, "top__leaf")
+
+        self.assertEqual(leaf_module.count("always @(posedge eth_tx_clk)"), 1)
+        self.assertNotIn("sys_clk", leaf_module)
+        self.assertNotIn("sys_rst", leaf_module)
+
+    def test_hierarchical_memory_port_declares_clock(self):
+        top = _MemoryTop()
+
+        old_top = LiteXContext.top
+        try:
+            LiteXContext.top = top
+            verilog = convert(top, ios={top.o}, name="top", hierarchical=True).main_source
+        finally:
+            LiteXContext.top = old_top
+
+        leaf_module = self._module_body(verilog, "top__leaf")
+        top_module  = self._module_body(verilog, "top")
+
+        self.assertRegex(leaf_module, r"input\s+wire\s+sys_clk")
+        self.assertIn("always @(posedge sys_clk)", leaf_module)
+        self.assertIn(".sys_clk(sys_clk)", top_module)
+
+    def test_hierarchical_shared_memory_is_emitted_once(self):
+        top = _SharedMemoryTop()
+
+        old_top = LiteXContext.top
+        try:
+            LiteXContext.top = top
+            verilog = convert(top, ios={top.adr, top.o}, name="top", hierarchical=True).main_source
+        finally:
+            LiteXContext.top = old_top
+
+        owner_module = self._module_body(verilog, "top__owner")
+        reader_module = self._module_body(verilog, "top__reader")
+
+        self.assertEqual(verilog.count("reg [7:0] mem[0:3];"), 1)
+        self.assertIn("reg [7:0] mem[0:3];", owner_module)
+        self.assertNotIn("reg [7:0] mem[0:3];", reader_module)
+        self.assertRegex(owner_module, r"output\s+wire\s+\[7:0\]\s+dat_r")
+        self.assertRegex(reader_module, r"input\s+wire\s+\[7:0\]\s+dat_r")
