@@ -91,6 +91,7 @@ static void help(void)
 #ifdef WITH_CXX
 	puts("hellocpp           - Hello C++");
 #endif
+	puts("hdmi               - HDMI framebuffer color bars (if present)");
 }
 
 /*-----------------------------------------------------------------------*/
@@ -142,6 +143,8 @@ static void donut_cmd(void)
 	donut();
 }
 
+extern void hdmi_pattern_cmd(void);
+
 extern void helloc(void);
 
 static void helloc_cmd(void)
@@ -184,6 +187,8 @@ static void console_service(void)
 		donut_cmd();
 	else if(strcmp(token, "helloc") == 0)
 		helloc_cmd();
+	else if(strcmp(token, "hdmi") == 0)
+		hdmi_pattern_cmd();
 #ifdef WITH_CXX
 	else if(strcmp(token, "hellocpp") == 0)
 		hellocpp_cmd();
@@ -198,6 +203,10 @@ int main(void)
 	irq_setie(1);
 #endif
 	uart_init();
+
+#ifdef VIDEO_FRAMEBUFFER_HRES
+	hdmi_pattern_cmd();
+#endif
 
 	help();
 	prompt();
